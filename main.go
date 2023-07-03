@@ -239,9 +239,6 @@ func (aa *aaOptimizer) optimizePass1() {
 }
 
 func (aa *aaOptimizer) identicalChildren(l, r *leaf) bool {
-	// /sys/devices/virtual/net/tap*/**
-	// /sys/devices/virtual/net/bchat*/**
-	// /sys/devices/virtual/net/mstp*/**/dev
 	if len(l.children) != len(r.children) {
 		return false
 	}
@@ -425,12 +422,3 @@ func main() {
 		fmt.Printf("aaoptimizer: %v", err)
 	}
 }
-
-//    /sys/devices/**/bConfigurationValue r,
-//    /sys/devices/**/descriptors r,
-//    /sys/devices/**/manufacturer r,
-//    /sys/devices/**/product r,
-//    /sys/devices/**/revision r,
-//    /sys/devices/**/serial r,
-//    /sys/devices/**/vendor r,
-// =>  /sys/devices/**/{bConfigurationValue,descriptors,manufacturer,product,revision,serial,vendor} r,
