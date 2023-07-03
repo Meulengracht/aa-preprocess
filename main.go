@@ -41,14 +41,7 @@ func (r *rule) next() (string, bool) {
 	return n, r.current == len(r.pathTokens)
 }
 
-func (r *rule) reset() {
-	r.current = 0
-}
-
 type leaf struct {
-	// dir is only set to true if the expression
-	// ended as a dir (trailing slash)
-	dir      bool
 	part     string
 	children map[string]*leaf
 }
@@ -60,26 +53,13 @@ func newLeaf(p string) *leaf {
 	}
 }
 
-func (l *leaf) isDirectory() bool {
-	return l.dir || len(l.children) > 0
-}
-
-func (l *leaf) processToken(p string, last bool) {
+func (l *leaf) addToken(p string) *leaf {
 	nl := l.children[p]
 	if nl == nil {
 		nl = newLeaf(p)
 		l.children[p] = nl
 	}
-	if !last {
-		// special case, if the last token is empty
-		// then this was a directory and we want to stop
-		// anyway
-		if r.pathTokens[r.current] == "" {
-			nl.dir = true
-			return
-		}
-		nl.addRule(r)
-	}
+	return nl
 }
 
 func (l *leaf) addRule(r rule) {
@@ -88,26 +68,18 @@ func (l *leaf) addRule(r rule) {
 		pt := strings.Trim(p, "{}")
 		pts := strings.Split(pt, ",")
 		for _, t := range pts {
-			if t == "" {
-				// include dir
+			nl := l.addToken(t)
+			if !last {
+				cl := r.current
+				nl.addRule(r)
+				r.current = cl
 			}
-			l.processToken(t, last)
 		}
-	}
-	nl := l.children[p]
-	if nl == nil {
-		nl = newLeaf(p)
-		l.children[p] = nl
-	}
-	if !last {
-		// special case, if the last token is empty
-		// then this was a directory and we want to stop
-		// anyway
-		if r.pathTokens[r.current] == "" {
-			nl.dir = true
-			return
+	} else {
+		nl := l.addToken(p)
+		if !last {
+			nl.addRule(r)
 		}
-		nl.addRule(r)
 	}
 }
 
@@ -121,6 +93,19 @@ func (l *leaf) dump(ctx string) {
 	for _, c := range l.children {
 		c.dump(nctx)
 	}
+}
+
+func (l *leaf) format(ctx, perms string) []string {
+	var lines []string
+	nctx := fmt.Sprintf("%s/%s", ctx, l.part)
+	if len(l.children) == 0 {
+		lines = append(lines, fmt.Sprintf("  %s %s", nctx, perms))
+	}
+
+	for _, c := range l.children {
+		lines = append(lines, c.format(nctx, perms)...)
+	}
+	return lines
 }
 
 type aaOptimizer struct {
@@ -149,12 +134,66 @@ func (aa *aaOptimizer) addRule(rs string) {
 	l.addRule(r)
 }
 
+func (aa *aaOptimizer) combineLeafs(dst, src *leaf) {
+	for _, s := range src.children {
+		d := dst.children[s.part]
+		if d != nil {
+			aa.combineLeafs(d, s)
+		} else {
+			dst.children[s.part] = s
+		}
+	}
+}
+
+// Combine things like:
+// /sys/devices/*/xxx r,
+// /sys/devices/**/xxx r,
+func (aa *aaOptimizer) optimizeTreePass0(l *leaf) {
+	// /tmp/*   => Files directly in /tmp.
+	// /tmp/*/  => Directories directly in /tmp.
+	// /tmp/**  => Files and directories anywhere underneath /tmp.
+	// /tmp/**/ => Directories anywhere underneath /tmp.
+
+	var swc *leaf
+	var dwc *leaf
+	for _, c := range l.children {
+		if c.part == "*" {
+			swc = c
+		} else if c.part == "**" {
+			dwc = c
+		}
+	}
+
+	if swc != nil && dwc != nil {
+		if len(dwc.children) == 0 {
+			// combine /* and /*/ with /**, /** covers anything
+			// when they have identical perms and overrules that
+			delete(l.children, "*")
+		} else if len(dwc.children) > 0 && len(swc.children) > 0 {
+			// combine /*/ with /**/
+			aa.combineLeafs(dwc, swc)
+			delete(l.children, "*")
+		}
+	}
+
+	for _, c := range l.children {
+		aa.optimizeTreePass0(c)
+	}
+}
+
+func (aa *aaOptimizer) optimizePass0() {
+	for _, l := range aa.trees {
+		aa.optimizeTreePass0(l)
+	}
+}
+
 func (aa *aaOptimizer) optimizeTreePass1(l *leaf) bool {
 	if len(l.children) == 0 {
 		return true
 	}
 
-	// if we do have children, then they must not have it
+	// if we do have children, then they must not have it, or they
+	// must be identical
 	var parts []string
 	children := make(map[string]*leaf)
 	for _, c := range l.children {
@@ -199,129 +238,72 @@ func (aa *aaOptimizer) optimizePass1() {
 	}
 }
 
-func (aa *aaOptimizer) isDirectory(l *leaf) bool {
-	if len(l.children) == 0 {
-		return l.dir
+func (aa *aaOptimizer) identicalChildren(l, r *leaf) bool {
+	// /sys/devices/virtual/net/tap*/**
+	// /sys/devices/virtual/net/bchat*/**
+	// /sys/devices/virtual/net/mstp*/**/dev
+	if len(l.children) != len(r.children) {
+		return false
 	}
-
-	for _, c := range l.children {
-		if !aa.isDirectory(c) {
+	for _, cl := range l.children {
+		rl := r.children[cl.part]
+		if rl == nil {
+			return false
+		}
+		if !aa.identicalChildren(cl, rl) {
 			return false
 		}
 	}
 	return true
 }
 
-// Check if leftCs covers rightCs
-func (aa *aaOptimizer) isCoveredChildren(leftCs map[string]*leaf, rightCs map[string]*leaf) bool {
-	for _, c := range rightCs {
-		if !aa.isCovered(leftCs, c) {
-			return false
-		}
-	}
-	return true
-}
-
-func (aa *aaOptimizer) isCovered(ls map[string]*leaf, l *leaf) bool {
-	// /tmp/*   => Files directly in /tmp.
-	// /tmp/*/  => Directories directly in /tmp.
-	// /tmp/**  => Files and directories anywhere underneath /tmp.
-	// /tmp/**/ => Directories anywhere underneath /tmp.
-	for _, c := range ls {
-		if c.part == "**" {
-			if !c.dir && len(c.children) == 0 {
-				// expr ended with /** => covers *everything*
-				return true
-			} else if c.dir && len(c.children) == 0 {
-				// expr ended with /**/ => covers any directories under this children
-				return aa.isDirectory(l)
-			}
-			// otherwise the expr is going like this /**/... and we need
-			// to verify down the chain
-			return aa.isCoveredChildren(c.children, l.children)
-		} else if c.part == "*" {
-			if len(c.children) == 0 {
-				// expr ended with /* => covers files directly under, which means
-				// l must be a file
-				return !l.isDirectory()
-			} else if c.dir && len(c.children) == 0 {
-				// expr ended with /*/ => covers directories directly under, which
-				// means the leaf must have ended with a trailing slash here
-				return l.dir
-			}
-			// otherwise the expr is going like this /*/... and we need
-			// to verify down the chain
-			return aa.isCoveredChildren(c.children, l.children)
+func (aa *aaOptimizer) containsUnbracketedComma(p string) bool {
+	var sawBracket bool
+	for _, r := range p {
+		if r == '{' {
+			sawBracket = true
+		} else if r == ',' && !sawBracket {
+			return true
 		}
 	}
 	return false
 }
 
-func (aa *aaOptimizer) canCover(ls map[string]*leaf, l *leaf) []string {
-	// /tmp/*   => Files directly in /tmp.
-	// /tmp/*/  => Directories directly in /tmp.
-	// /tmp/**  => Files and directories anywhere underneath /tmp.
-	// /tmp/**/ => Directories anywhere underneath /tmp.
-	var keys []string
-	for k, c := range ls {
-		// canCover is only called if l.part == * or l.part == **
-		switch {
-		case l.part == "*" && !l.dir && len(l.children) == 0:
-			// expr ends on /*, which means we can cover this *if* c is
-			// file
-			if !c.dir && len(c.children) == 0 {
-				keys = append(keys, k)
-			}
-		case l.part == "*" && l.dir:
-			// expr ends on /*/, this means we can cover this iff c
-			// is a directory (and expr ended)
-			if c.dir {
-				keys = append(keys, k)
-			}
-		case l.part == "*":
-			// /*/ is just a part of expression, we must follow child
-			if aa.isCoveredChildren(l.children, c.children) {
-				keys = append(keys, k)
-			}
-		case l.part == "**" && !l.dir && len(l.children) == 0:
-			// expr ends on /**, which means we can cover this in any case
-			keys = append(keys, k)
-		case l.part == "**" && l.dir:
-			// expr ends on /**/, which means we cover this *if* c is a directory
-			if aa.isDirectory(c) {
-				keys = append(keys, k)
-			}
-		case l.part == "*":
-			// /*/ is just a part of expression, we must follow child
-			if aa.isCoveredChildren(l.children, c.children) {
-				keys = append(keys, k)
-			}
-		}
-	}
-	return keys
-}
-
 func (aa *aaOptimizer) optimizeTreePass2(l *leaf) {
-	optimized := make(map[string]*leaf)
-	for _, c := range l.children {
-		if c.part != "*" && c.part != "**" {
-			if aa.isCovered(optimized, c) {
-				continue
-			}
-		} else {
-			covers := aa.canCover(optimized, c)
-			for _, cv := range covers {
-				delete(optimized, cv)
+	if len(l.children) > 1 {
+		for _, cl := range l.children {
+			for _, rl := range l.children {
+				if rl == cl {
+					continue
+				}
+				if aa.identicalChildren(cl, rl) {
+					p := fmt.Sprintf("%s,%s", strings.Trim(cl.part, "{}"), strings.Trim(rl.part, "{}"))
+					delete(l.children, cl.part)
+					delete(l.children, rl.part)
+					cl.part = p
+					l.children[p] = cl
+				}
 			}
 		}
-		optimized[c.part] = c
 	}
-	l.children = optimized
+
+	// fixup namings
+	for _, c := range l.children {
+		if aa.containsUnbracketedComma(c.part) {
+			if !strings.HasPrefix(c.part, "{") {
+				p := fmt.Sprintf("{%s}", c.part)
+				delete(l.children, c.part)
+				c.part = p
+				l.children[p] = c
+			}
+		}
+	}
+
+	for _, c := range l.children {
+		aa.optimizeTreePass2(c)
+	}
 }
 
-// Combine things like
-// /sys/devices/**/block/**
-// /sys/devices/*/block/{,**}
 func (aa *aaOptimizer) optimizePass2() {
 	for _, l := range aa.trees {
 		aa.optimizeTreePass2(l)
@@ -332,6 +314,14 @@ func (aa *aaOptimizer) dump() {
 	for _, t := range aa.trees {
 		t.dump("")
 	}
+}
+
+func (aa *aaOptimizer) format() []string {
+	var lines []string
+	for p, t := range aa.trees {
+		lines = append(lines, t.format("", p)...)
+	}
+	return lines
 }
 
 func readLines(path string) ([]string, error) {
@@ -349,33 +339,91 @@ func readLines(path string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
-func main() {
-	fmt.Println("Hello, World!")
-
-	lines, err := readLines("./slow.apparmor")
+func writeLines(lines []string, path string) error {
+	file, err := os.Create(path)
 	if err != nil {
-		fmt.Printf("%v", err)
+		return err
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
+	for _, line := range lines {
+		fmt.Fprintln(w, line)
+	}
+	return w.Flush()
+}
+
+func insert(a []string, index int, s string) []string {
+	if len(a) == index {
+		return append(a, s)
+	}
+	a = append(a[:index+1], a[index:]...)
+	a[index] = s
+	return a
+}
+
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Println("usage: aaoptimizer [input] [output]")
+		os.Exit(-1)
+	}
+
+	input := os.Args[1]
+	output := os.Args[2]
+
+	lines, err := readLines(input)
+	if err != nil {
+		fmt.Printf("aaoptimizer: %v", err)
 		return
 	}
 
 	aa := newAaOptimizer()
 	pathsToOptimize := []string{"/sys/devices"}
-	for _, l := range lines {
+
+	// simple stupid replacement from the last encounter
+	insertAt := -1
+	var filteredLines []string
+	for i, l := range lines {
 		tl := strings.Trim(l, " ")
 		if !strings.HasPrefix(tl, pathsToOptimize[0]) {
+			filteredLines = append(filteredLines, l)
 			continue
+		}
+		if insertAt == -1 {
+			insertAt = i
 		}
 		aa.addRule(tl)
 	}
 
-	fmt.Printf("original (len=%d):\n", len(lines))
-	aa.dump()
-	fmt.Println("pass 1:")
+	//fmt.Printf("original:\n")
+	//aa.dump()
+	fmt.Println("executing pass 0")
+	aa.optimizePass0()
+	//aa.dump()
+
+	// must be last passes
+	fmt.Println("executing pass 1")
 	aa.optimizePass1()
-	aa.dump()
-	fmt.Println("pass 2:")
+	//aa.dump()
+	fmt.Println("executing pass 2")
 	aa.optimizePass2()
-	aa.dump()
+	//aa.dump()
+
+	// insert a small header
+	insert(filteredLines, insertAt, "\n  # generated by aa-optimizer app")
+	insertAt++
+
+	// insert into filteredLines
+	rls := aa.format()
+	for _, r := range rls {
+		filteredLines = insert(filteredLines, insertAt, r)
+		insertAt++
+	}
+
+	err = writeLines(filteredLines, output)
+	if err != nil {
+		fmt.Printf("aaoptimizer: %v", err)
+	}
 }
 
 //    /sys/devices/**/bConfigurationValue r,
