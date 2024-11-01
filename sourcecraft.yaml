@@ -1,0 +1,40 @@
+# This file configures Sourcecraft.
+
+# (Required)
+# The source package name, no spaces
+name: aa-preprocess
+
+# (Required)
+# The source package version
+version: git  # source version, typically '1.3.2' or '1.2+git'
+
+# (Required)
+# Version of the build base OS
+base: ubuntu@24.04
+
+# (Recommended)
+title: Sourcecraft Template Package
+
+# (Required)
+summary: Preprocessor tool for aa profiles
+
+# (Required)
+description: |
+  Used to optimize AA profiles to consolidate rules that match.
+
+# (Required)
+# Platforms that package targets
+platforms:
+  amd64:
+  arm64:
+  armhf:
+  i386:
+  ppc64el:
+  riscv64:
+  s390x:
+
+parts:
+  aa-preprocess:
+    # See 'sourcecraft plugins'
+    plugin: nil
+    source: .
